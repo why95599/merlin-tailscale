@@ -8,6 +8,7 @@
 #   - Works without USB / Entware
 #   - Persistent data in /jffs; large binaries in /tmp
 #   - Whole primary LAN/Wi-Fi can use ONE remote Tailscale Exit Node
+#   - Router can advertise itself as a Tailscale Exit Node
 #
 # Tested core path:
 #   RT-AX86U / Asuswrt-Merlin 3004.388.11 / aarch64 / Tailscale 1.102.4
@@ -15,6 +16,7 @@
 #
 # Notes:
 #   - This V1 targets the primary LAN bridge (usually br0), not guest VLANs.
+#   - Advertising an Exit Node needs approval in the Tailscale admin console.
 #   - IPv6 forwarding from the primary LAN is blocked while Exit Mode is ON.
 #   - This is NOT a kill-switch: if tailscaled dies, IPv4 may fall back to WAN.
 #   - Designed for a standalone Tailscale gateway; coexistence with other transparent-proxy stacks is out of scope.
@@ -44,6 +46,7 @@ VERSION=""
 MIRROR_BASE=""
 EXIT_NODE=""
 BLOCK_IPV6="1"
+ADVERTISE_EXIT="0"
 
 say() { echo "[TSM] $*"; }
 warn() { echo "[TSM][WARN] $*" >&2; }
@@ -90,6 +93,7 @@ VERSION=''
 MIRROR_BASE=''
 EXIT_NODE=''
 BLOCK_IPV6='1'
+ADVERTISE_EXIT='0'
 EOF
         chmod 600 "$CONF"
     fi
@@ -101,6 +105,7 @@ load_config() {
     MIRROR_BASE=""
     EXIT_NODE=""
     BLOCK_IPV6="1"
+    ADVERTISE_EXIT="0"
     [ -f "$CONF" ] && . "$CONF"
 }
 
@@ -110,6 +115,7 @@ VERSION='$VERSION'
 MIRROR_BASE='$MIRROR_BASE'
 EXIT_NODE='$EXIT_NODE'
 BLOCK_IPV6='$BLOCK_IPV6'
+ADVERTISE_EXIT='$ADVERTISE_EXIT'
 EOF
     chmod 600 "$CONF"
 }
@@ -514,6 +520,64 @@ restore_exit() {
     return 0
 }
 
+ensure_exit_forwarding() {
+    if ! echo 1 >/proc/sys/net/ipv4/ip_forward; then
+        err "无法启用 IPv4 转发。"
+        return 1
+    fi
+    if [ -e /proc/sys/net/ipv6/conf/all/forwarding ]; then
+        if ! echo 1 >/proc/sys/net/ipv6/conf/all/forwarding; then
+            err "无法启用 IPv6 转发。"
+            return 1
+        fi
+    else
+        warn "系统未提供 IPv6 转发开关；请在其他设备上检查 IPv6 出口。"
+    fi
+}
+
+restore_advertisement() {
+    load_config
+    tailscale_ready || return 1
+
+    if [ "$ADVERTISE_EXIT" = "1" ]; then
+        ensure_exit_forwarding || return 1
+        "$TS" set --advertise-exit-node=true
+    else
+        # State may have retained a previous advertisement across reinstall.
+        "$TS" set --advertise-exit-node=false
+    fi
+}
+
+enable_exit_advertisement() {
+    init_base
+    tailscale_ready || {
+        err "请先安装并登录 Tailscale。"
+        return 1
+    }
+    detect_current_exit
+    if [ -n "$EXIT_NODE" ]; then
+        err "本路由器正在使用远程 Exit Node，请先在菜单中取消该模式。"
+        return 1
+    fi
+    ensure_exit_forwarding || return 1
+    "$TS" set --advertise-exit-node=true || return 1
+    ADVERTISE_EXIT="1"
+    save_config
+    say "路由器已申请提供 Exit Node；请到 Tailscale 管理后台批准出口路由。"
+}
+
+disable_exit_advertisement() {
+    init_base
+    if ! tailscale_ready; then
+        err "Tailscale 未运行或未登录，无法确认关闭。请启动后重试。"
+        return 1
+    fi
+    "$TS" set --advertise-exit-node=false || return 1
+    ADVERTISE_EXIT="0"
+    save_config
+    say "路由器已停止提供 Exit Node。"
+}
+
 repair_tailscale_rules_if_needed() {
     pidof tailscaled >/dev/null 2>&1 || return 0
 
@@ -557,14 +621,16 @@ boot_main() {
 
     detect_current_exit
     restore_exit >/dev/null 2>&1
+    restore_advertisement >/dev/null 2>&1 || syslog "boot: exit-node advertisement restore failed"
 
-    syslog "boot complete version=$VERSION exit=${EXIT_NODE:-off}"
+    syslog "boot complete version=$VERSION exit=${EXIT_NODE:-off} advertise=$ADVERTISE_EXIT"
     exit 0
 }
 
 nat_restore_main() {
     init_base
     load_config
+    [ "$ADVERTISE_EXIT" = "1" ] && ensure_exit_forwarding >/dev/null 2>&1
     [ -n "$EXIT_NODE" ] || exit 0
     repair_tailscale_rules_if_needed
     apply_nat >/dev/null 2>&1
@@ -573,6 +639,7 @@ nat_restore_main() {
 firewall_restore_main() {
     init_base
     load_config
+    [ "$ADVERTISE_EXIT" = "1" ] && ensure_exit_forwarding >/dev/null 2>&1
     [ -n "$EXIT_NODE" ] || exit 0
     repair_tailscale_rules_if_needed
     apply_ipv6_block >/dev/null 2>&1
@@ -597,6 +664,7 @@ upgrade_latest() {
         say "当前运行文件已经是最新版本。"
         start_daemon
         detect_current_exit
+        restore_advertisement >/dev/null 2>&1
         return 0
     fi
 
@@ -615,6 +683,7 @@ upgrade_latest() {
     sleep 3
     detect_current_exit
     restore_exit >/dev/null 2>&1
+    restore_advertisement >/dev/null 2>&1
 
     say "Tailscale 已安装/升级到 $VERSION。"
     if "$TS" status >/dev/null 2>&1; then
@@ -646,6 +715,7 @@ login_interactive() {
 
     if [ "$_rc" -eq 0 ]; then
         detect_current_exit
+        restore_advertisement >/dev/null 2>&1
         say "Tailscale 登录/连接完成。"
         "$TS" status
     fi
@@ -670,6 +740,10 @@ list_exit_nodes() {
 choose_exit_node() {
     if ! tailscale_ready; then
         err "Tailscale 尚未登录或未运行。"
+        return 1
+    fi
+    if [ "$ADVERTISE_EXIT" = "1" ]; then
+        err "本路由器正在提供 Exit Node，请先关闭该功能。"
         return 1
     fi
 
@@ -762,6 +836,7 @@ show_status() {
     echo "LAN 网段:        ${LAN_CIDR:-unknown}"
     echo "VPS 镜像:        ${MIRROR_BASE:-未设置}"
     echo "保存 Exit Node:  ${EXIT_NODE:-OFF}"
+    echo "本机提供出口:    $ADVERTISE_EXIT"
     echo "Exit 模式挡IPv6: $BLOCK_IPV6"
     echo ""
 
@@ -822,7 +897,169 @@ restart_tailscale() {
     start_daemon || return 1
     sleep 3
     restore_exit
+    restore_advertisement || return 1
     say "tailscaled 已重启。"
+}
+
+remove_hook_block() {
+    _file="$1"
+    _marker="$2"
+    _expected="$3"
+    [ -f "$_file" ] || return 0
+    _tmp="${_file}.ts-manager.$$"
+
+    # Remove only a marker followed by the exact command this manager wrote.
+    # A changed command is left intact and stops uninstall for manual review.
+    if ! awk -v marker="$_marker" -v expected="$_expected" '
+        $0 == marker {
+            if ((getline following) <= 0) {
+                print marker
+                bad=1
+                next
+            }
+            if (following == expected) next
+            print marker
+            print following
+            bad=1
+            next
+        }
+        { print }
+        END { if (bad) exit 2 }
+    ' "$_file" >"$_tmp"; then
+        rm -f "$_tmp"
+        err "钩子内容已变化，未修改 $_file；请手动检查 $_marker。"
+        return 1
+    fi
+    chmod 755 "$_tmp" && mv -f "$_tmp" "$_file"
+}
+
+check_hook_block() {
+    _file="$1"
+    _marker="$2"
+    _expected="$3"
+    [ -f "$_file" ] || return 0
+    awk -v marker="$_marker" -v expected="$_expected" '
+        $0 == marker {
+            if ((getline following) <= 0 || following != expected) exit 2
+        }
+    ' "$_file" || {
+        err "钩子内容已变化，已停止卸载；请手动检查 $_file 中的 $_marker。"
+        return 1
+    }
+}
+
+remove_hooks() {
+    check_hook_block "/jffs/scripts/services-start" "# ts-manager: boot" \
+        "$SELF boot >/tmp/ts-manager-boot.log 2>&1 &" || return 1
+    check_hook_block "/jffs/scripts/wan-start" "# ts-manager: wan retry" \
+        "$SELF boot >/tmp/ts-manager-wan.log 2>&1 &" || return 1
+    check_hook_block "/jffs/scripts/nat-start" "# ts-manager: restore NAT" \
+        "$SELF nat-restore >/dev/null 2>&1 &" || return 1
+    check_hook_block "/jffs/scripts/firewall-start" "# ts-manager: restore firewall" \
+        "$SELF firewall-restore >/dev/null 2>&1 &" || return 1
+
+    remove_hook_block "/jffs/scripts/services-start" "# ts-manager: boot" \
+        "$SELF boot >/tmp/ts-manager-boot.log 2>&1 &" || return 1
+    remove_hook_block "/jffs/scripts/wan-start" "# ts-manager: wan retry" \
+        "$SELF boot >/tmp/ts-manager-wan.log 2>&1 &" || return 1
+    remove_hook_block "/jffs/scripts/nat-start" "# ts-manager: restore NAT" \
+        "$SELF nat-restore >/dev/null 2>&1 &" || return 1
+    remove_hook_block "/jffs/scripts/firewall-start" "# ts-manager: restore firewall" \
+        "$SELF firewall-restore >/dev/null 2>&1 &"
+}
+
+stop_managed_daemon() {
+    _managed=""
+    for _pid in $(pidof tailscaled 2>/dev/null); do
+        if tr '\000' '\n' <"/proc/$_pid/cmdline" 2>/dev/null |
+            grep -Fx -- "--state=$STATE" >/dev/null 2>&1; then
+            _managed="$_managed $_pid"
+        else
+            err "检测到非本脚本管理的 tailscaled (PID $_pid)，已停止卸载。"
+            return 1
+        fi
+    done
+    [ -n "$_managed" ] || return 0
+    kill $_managed 2>/dev/null || return 1
+    _n=0
+    while [ "$_n" -lt 10 ]; do
+        _alive=0
+        for _pid in $_managed; do
+            [ -d "/proc/$_pid" ] && _alive=1
+        done
+        [ "$_alive" = "0" ] && return 0
+        sleep 1
+        _n=$((_n + 1))
+    done
+    err "tailscaled 未正常退出，已停止卸载。"
+    return 1
+}
+
+uninstall_manager() {
+    _mode="${1:-keep-state}"
+    case "$_mode" in
+        keep-state|purge) ;;
+        *) err "未知卸载模式: $_mode"; return 1 ;;
+    esac
+    if [ -d "$LOCKDIR" ]; then
+        err "开机恢复任务仍在执行（$LOCKDIR），请稍后重试。"
+        return 1
+    fi
+    # Check daemon ownership before removing any hooks.
+    for _pid in $(pidof tailscaled 2>/dev/null); do
+        if ! tr '\000' '\n' <"/proc/$_pid/cmdline" 2>/dev/null |
+            grep -Fx -- "--state=$STATE" >/dev/null 2>&1; then
+            err "检测到非本脚本管理的 tailscaled (PID $_pid)，已停止卸载。"
+            return 1
+        fi
+    done
+
+    remove_hooks || return 1
+    if [ -x "$TS" ] && pidof tailscaled >/dev/null 2>&1; then
+        "$TS" set --advertise-exit-node=false >/dev/null 2>&1 ||
+            warn "未能取消提供 Exit Node；重装后将按新配置关闭。"
+        "$TS" set --exit-node= >/dev/null 2>&1 ||
+            warn "未能取消使用远程 Exit Node。"
+    fi
+    stop_managed_daemon || return 1
+    remove_nat
+    remove_ipv6_block
+    rm -rf "$RUNTIME" "$RUNTIME_NEW" "$RUNTIME_OLD" "$STAGE" "$LOCKDIR"
+    rm -f "$PKG" "$LOG" /tmp/ts-manager-exitnodes \
+        /tmp/ts-manager-boot.log /tmp/ts-manager-wan.log
+    rm -f "$CONF" "$SELF"
+
+    if [ "$_mode" = "purge" ]; then
+        rm -f "$STATE"
+        say "完全卸载完成，本机登录状态已删除；管理后台中的设备记录需自行处理。"
+    else
+        [ -f "$STATE" ] && chmod 600 "$STATE" 2>/dev/null
+        say "安全卸载完成；登录状态保留在 $STATE。"
+    fi
+    rmdir "$BASE" 2>/dev/null || true
+}
+
+uninstall_interactive() {
+    echo ""
+    echo "1) 安全卸载（保留登录状态）"
+    echo "2) 完全卸载（删除本机登录状态）"
+    echo "0) 取消"
+    printf "请选择: "
+    read _choice
+    case "$_choice" in
+        1) uninstall_manager keep-state ;;
+        2)
+            printf "输入 DELETE 确认删除 $STATE: "
+            read _confirm
+            [ "$_confirm" = "DELETE" ] || {
+                say "已取消完全卸载。"
+                return 1
+            }
+            uninstall_manager purge
+            ;;
+        0) return 1 ;;
+        *) warn "无效选择。"; return 1 ;;
+    esac
 }
 
 menu() {
@@ -843,6 +1080,9 @@ menu() {
         echo "7) 设置 VPS 下载镜像"
         echo "8) 重启 Tailscale"
         echo "9) 安装 / 修复 Merlin 开机钩子"
+        echo "10) 将本路由器设为 Exit Node"
+        echo "11) 关闭本路由器 Exit Node"
+        echo "12) 安全卸载 / 完全卸载"
         echo "0) 退出"
         echo ""
         printf "请选择: "
@@ -858,6 +1098,9 @@ menu() {
             7) set_mirror ;;
             8) restart_tailscale ;;
             9) install_hooks ;;
+            10) enable_exit_advertisement ;;
+            11) disable_exit_advertisement ;;
+            12) uninstall_interactive && exit 0 ;;
             0) exit 0 ;;
             *) warn "无效选择。" ;;
         esac
@@ -874,7 +1117,7 @@ case "${1:-menu}" in
     firewall-restore) firewall_restore_main ;;
     status) show_status ;;
     start)
-        ensure_runtime_retry && start_daemon && restore_exit
+        ensure_runtime_retry && start_daemon && restore_exit && restore_advertisement
         ;;
     stop)
         stop_daemon
@@ -894,11 +1137,20 @@ case "${1:-menu}" in
     hooks)
         install_hooks
         ;;
+    offer-exit-on)
+        enable_exit_advertisement
+        ;;
+    offer-exit-off)
+        disable_exit_advertisement
+        ;;
+    uninstall)
+        uninstall_manager keep-state
+        ;;
     menu|'')
         menu
         ;;
     *)
-        echo "Usage: $0 [menu|boot|status|start|stop|restart|upgrade|login|exit-off|hooks]"
+        echo "Usage: $0 [menu|boot|status|start|stop|restart|upgrade|login|exit-off|offer-exit-on|offer-exit-off|hooks|uninstall]"
         exit 1
         ;;
 esac
