@@ -14,5 +14,8 @@ Asuswrt-Merlin Tailscale Manager
 - ARM64
 - Tailscale 1.102.4
 
-安装：
+安装最新版 main：
 wget -qO /tmp/ts-manager.sh https://raw.githubusercontent.com/why95599/merlin-tailscale/main/ts-manager.sh && sh /tmp/ts-manager.sh
+
+安装稳定版v1.0.0：
+wget -qO /tmp/ts-manager.sh https://raw.githubusercontent.com/why95599/merlin-tailscale/v1.0.0/ts-manager.sh && sh /tmp/ts-manager.sh
