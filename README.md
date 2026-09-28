@@ -19,7 +19,7 @@ Asuswrt-Merlin Tailscale Manager
 - ARM
 - Tailscale 1.102.4
 
-  特别注意，如果华硕梅林固件路由器不是pppoe，做二级路由时，dns一般为上级路由器分配内网ip，DNS如为内网ip就不能走ts隧道查询，请把华硕路由器DNS手动指定为1.1.1.1和8.8.8.8。
+  特别注意，如果华硕梅林固件路由器做二级路由时，dns一般为上级路由器分配的内网ip，DNS如为内网ip就不能走ts隧道查询，请把华硕路由器DNS手动指定为1.1.1.1和8.8.8.8。
 
 安装最新版 main：
 wget -qO /tmp/ts-manager.sh https://raw.githubusercontent.com/why95599/merlin-tailscale/main/ts-manager.sh && sh /tmp/ts-manager.sh
